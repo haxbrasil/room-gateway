@@ -7,6 +7,14 @@ on:
 jobs:
   ci:
     runs-on: ubuntu-latest
+    env:
+      NODE_ENV: test
+      PORT: 3011
+      REDIS_URL: redis://127.0.0.1:6381/0
+      GATEWAY_JWT_PUBLIC_KEY: gateway-jwt-secret
+      GATEWAY_JWT_ALGO: HS256
+      GATEWAY_JWT_ISS: haxbrasil-gateway
+      GATEWAY_JWT_AUD: haxbrasil-room-server
 
     steps:
       - name: Checkout
@@ -36,4 +44,4 @@ jobs:
         run: pnpm run build
 
       - name: Test
-        run: pnpm exec jest --config ./test/jest-e2e.json --passWithNoTests
+        run: pnpm run test:e2e:docker
