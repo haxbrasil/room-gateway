@@ -20,6 +20,7 @@ type RoomPropertiesOverrides = Partial<RoomProperties>;
 type OpenRoomCommandOverrides = Partial<OpenRoomCommand>;
 type CloseRoomCommandOverrides = Partial<CloseRoomCommand>;
 type RoomServerCapacityOverrides = Partial<RoomServerCapacity>;
+export type RoomServerClaimsFixtureOverrides = Partial<RoomServerClaims>;
 
 export function roomGeoFixture(overrides: RoomGeoOverrides = {}): RoomGeo {
   return {
@@ -133,7 +134,7 @@ export function roomServerSessionFixture(
 }
 
 export function roomServerClaimsFixture(
-  overrides: Partial<RoomServerClaims> = {},
+  overrides: RoomServerClaimsFixtureOverrides = {},
 ): RoomServerClaims {
   return {
     tenant: 'tenant-a',

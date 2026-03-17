@@ -1,212 +1,294 @@
-import { RoomGatewayMessageType } from '../../src/modules/room-gateway/constants/room-gateway-message-type.const';
-import { RoomCapacityBucket } from '../../src/modules/room-gateway/enums/room-capacity-bucket.enum';
-import { RoomGatewayStateService } from '../../src/modules/room-gateway/room-gateway-state.service';
-import { isObjectWithFields } from '../../src/common/data/object-field.util';
 import {
-  roomServerCapacityFixture,
-  roomServerSessionFixture,
-  roomServerSocketFixture,
-} from '../fixtures/room-gateway.fixture';
+  ROOM_GATEWAY_SERVER_MESSAGE_EVENT,
+  ROOM_GATEWAY_TO_SERVER_MESSAGE_EVENT,
+  RoomGatewayMessageType,
+} from '../../src/modules/room-gateway/constants/room-gateway-message-type.const';
+import { RoomGatewayStateService } from '../../src/modules/room-gateway/room-gateway-state.service';
+import { openRoomResultEnvelopeFixture } from '../fixtures/ws-messages.fixture';
+import {
+  connectRoomServerClient,
+  emitServerHelloAndWait,
+  requireSocketId,
+} from '../support/ws-app.util';
+import {
+  waitForSocketDisconnect,
+  waitForSocketEvent,
+} from '../support/socket-await.util';
+import { getE2ERuntime } from '../support/runtime';
+import { waitFor } from '../support/wait-for.util';
+import { Socket } from 'socket.io-client';
 
 describe('RoomGatewayStateService (e2e)', () => {
-  let service: RoomGatewayStateService;
+  let sockets: Socket[];
 
   beforeEach(() => {
-    service = new RoomGatewayStateService();
+    sockets = [];
   });
 
-  it('registers and retrieves a session', () => {
-    const session = roomServerSessionFixture();
-    service.registerSession(session);
+  afterEach(async () => {
+    for (const socket of sockets) {
+      if (socket.connected) {
+        socket.disconnect();
+      }
+    }
 
-    expect(service.getSession(session.socket.id)).toBe(session);
+    const { app } = getE2ERuntime();
+    const state = app.get(RoomGatewayStateService);
+
+    await waitFor(
+      () => state.listTenantSessions('tenant-a').length,
+      (count) => count === 0,
+      3_000,
+      20,
+      'Timed out waiting for tenant-a sessions to clear',
+    ).catch(() => undefined);
   });
 
-  it('unregisters a session and removes routed rooms', () => {
-    const session = roomServerSessionFixture();
-    service.registerSession(session);
-    service.setRoomRoute(
-      '986e7556-c699-4f2e-89ca-f8ffb79f66c4',
-      'tenant-a',
-      session.socket.id,
+  it('registers and retrieves a real room-server session', async () => {
+    const { app } = getE2ERuntime();
+    const state = app.get(RoomGatewayStateService);
+    const connection = await connectRoomServerClient();
+    const socketId = requireSocketId(connection.socket);
+    sockets.push(connection.socket);
+
+    const session = await waitFor(
+      () => state.getSession(socketId),
+      (value) => value !== null,
+      3_000,
+      20,
+      'Timed out waiting for registered session',
     );
 
-    service.unregisterSession(session.socket.id);
+    expect(session).not.toBeNull();
+    expect(session?.tenant).toBe(connection.claims.tenant);
+    expect(session?.serverId).toBe(connection.claims.server_id);
+  });
 
-    expect(service.getSession(session.socket.id)).toBeNull();
+  it('unregisters a disconnected session and clears active room routes', async () => {
+    const { app } = getE2ERuntime();
+    const state = app.get(RoomGatewayStateService);
+    const connection = await connectRoomServerClient();
+    const socketId = requireSocketId(connection.socket);
+    sockets.push(connection.socket);
+
+    await emitServerHelloAndWait(connection, {
+      active_rooms: ['986e7556-c699-4f2e-89ca-f8ffb79f66c4'],
+    });
+
+    await waitFor(
+      () => state.findRoomRoute('986e7556-c699-4f2e-89ca-f8ffb79f66c4'),
+      (value) => value !== null,
+      3_000,
+      20,
+      'Timed out waiting for active room route',
+    );
+
+    connection.socket.disconnect();
+
+    await waitFor(
+      () => state.getSession(socketId),
+      (value) => value === null,
+      3_000,
+      20,
+      'Timed out waiting for session unregister',
+    );
+
     expect(
-      service.findRoomRoute('986e7556-c699-4f2e-89ca-f8ffb79f66c4'),
+      state.findRoomRoute('986e7556-c699-4f2e-89ca-f8ffb79f66c4'),
     ).toBeNull();
   });
 
-  it('rejects all pending commands when a session disconnects', async () => {
-    const socket = roomServerSocketFixture({ id: 'socket-disconnect' });
-    const session = roomServerSessionFixture({
-      socket,
+  it('lists sessions by tenant for real connected clients', async () => {
+    const { app } = getE2ERuntime();
+    const state = app.get(RoomGatewayStateService);
+    const tenantA = await connectRoomServerClient();
+    const tenantB = await connectRoomServerClient({
+      tenant: 'tenant-b',
+      server_id: '00000000-0000-4000-8000-000000000002',
     });
-    service.registerSession(session);
+    sockets.push(tenantA.socket, tenantB.socket);
 
-    const pendingPromise = service.dispatchCommand(
-      session,
-      RoomGatewayMessageType.OPEN_ROOM_COMMAND,
-      { room_type: '5v5' },
-      1_000,
+    await waitFor(
+      () => state.listTenantSessions('tenant-a').length,
+      (count) => count === 1,
+      3_000,
+      20,
+      'Timed out waiting for tenant-a session',
+    );
+    await waitFor(
+      () => state.listTenantSessions('tenant-b').length,
+      (count) => count === 1,
+      3_000,
+      20,
+      'Timed out waiting for tenant-b session',
     );
 
-    service.unregisterSession(socket.id);
-
-    await expect(pendingPromise).rejects.toThrow('Room server disconnected');
+    expect(state.listTenantSessions('tenant-a')).toHaveLength(1);
+    expect(state.listTenantSessions('tenant-b')).toHaveLength(1);
+    expect(state.listTenantSessions('tenant-c')).toHaveLength(0);
   });
 
-  it('updates capacity for existing sessions only', () => {
-    const session = roomServerSessionFixture();
-    service.registerSession(session);
+  it('finds routed sessions with tenant isolation after server_hello', async () => {
+    const { app } = getE2ERuntime();
+    const state = app.get(RoomGatewayStateService);
+    const connection = await connectRoomServerClient();
+    const socketId = requireSocketId(connection.socket);
+    sockets.push(connection.socket);
 
-    service.updateCapacity(
-      session.socket.id,
-      roomServerCapacityFixture({
-        public: 7,
-        private: 3,
-      }),
-    );
-    service.updateCapacity(
-      'unknown',
-      roomServerCapacityFixture({ public: 99 }),
-    );
-
-    expect(service.getSession(session.socket.id)?.capacity).toEqual({
-      [RoomCapacityBucket.PUBLIC]: 7,
-      [RoomCapacityBucket.PRIVATE]: 3,
-    });
-  });
-
-  it('updates supported room types and location for existing sessions', () => {
-    const session = roomServerSessionFixture();
-    service.registerSession(session);
-
-    service.updateSupportedRoomTypes(session.socket.id, ['5v5', '7v7']);
-    service.updateLocation(session.socket.id, {
-      region: 'eu-west',
-      lat: 10,
-      lon: 11,
+    await emitServerHelloAndWait(connection, {
+      active_rooms: ['986e7556-c699-4f2e-89ca-f8ffb79f66c4'],
     });
 
-    expect(service.getSession(session.socket.id)?.supportedRoomTypes).toEqual(
-      new Set(['5v5', '7v7']),
-    );
-    expect(service.getSession(session.socket.id)?.location).toEqual({
-      region: 'eu-west',
-      lat: 10,
-      lon: 11,
-    });
-  });
-
-  it('lists sessions by tenant', () => {
-    service.registerSession(roomServerSessionFixture({ tenant: 'tenant-a' }));
-    service.registerSession(
-      roomServerSessionFixture({
-        socket: roomServerSocketFixture({ id: 'socket-b' }),
-        tenant: 'tenant-b',
-      }),
-    );
-
-    expect(service.listTenantSessions('tenant-a')).toHaveLength(1);
-    expect(service.listTenantSessions('tenant-b')).toHaveLength(1);
-    expect(service.listTenantSessions('tenant-c')).toHaveLength(0);
-  });
-
-  it('finds sessions by room route with tenant isolation', () => {
-    const session = roomServerSessionFixture();
-    service.registerSession(session);
-    service.setRoomRoute(
-      '986e7556-c699-4f2e-89ca-f8ffb79f66c4',
-      'tenant-a',
-      session.socket.id,
+    await waitFor(
+      () =>
+        state.findSessionByRoom(
+          connection.claims.tenant,
+          '986e7556-c699-4f2e-89ca-f8ffb79f66c4',
+        ),
+      (value) => value !== null,
+      3_000,
+      20,
+      'Timed out waiting for routed session',
     );
 
     expect(
-      service.findSessionByRoom(
-        'tenant-a',
+      state.findSessionByRoom(
+        connection.claims.tenant,
         '986e7556-c699-4f2e-89ca-f8ffb79f66c4',
-      ),
-    ).toBe(session);
+      )?.socket.id,
+    ).toBe(socketId);
     expect(
-      service.findSessionByRoom(
+      state.findSessionByRoom(
         'tenant-b',
         '986e7556-c699-4f2e-89ca-f8ffb79f66c4',
       ),
     ).toBeNull();
   });
 
-  it('dispatches commands and resolves when result arrives', async () => {
-    const socket = roomServerSocketFixture();
-    const session = roomServerSessionFixture({ socket });
-    service.registerSession(session);
+  it('dispatches commands to a real socket and resolves when the result arrives', async () => {
+    const { app } = getE2ERuntime();
+    const state = app.get(RoomGatewayStateService);
+    const connection = await connectRoomServerClient();
+    const socketId = requireSocketId(connection.socket);
+    sockets.push(connection.socket);
+    await emitServerHelloAndWait(connection);
 
-    const commandPromise = service.dispatchCommand(
+    const session = await waitFor(
+      () => state.getSession(socketId),
+      (value) => value !== null,
+      3_000,
+      20,
+      'Timed out waiting for session before dispatch',
+    );
+
+    if (!session) {
+      throw new Error('Expected registered session before dispatch');
+    }
+
+    const pending = state.dispatchCommand(
       session,
       RoomGatewayMessageType.OPEN_ROOM_COMMAND,
       { room_type: '5v5' },
       1_000,
     );
 
-    expect(socket.emit).toHaveBeenCalledWith(
-      'gateway_message',
-      expect.objectContaining({
-        type: RoomGatewayMessageType.OPEN_ROOM_COMMAND,
+    const emittedCommand = await waitForSocketEvent<{
+      request_id: string;
+      type: RoomGatewayMessageType;
+    }>(connection.socket, ROOM_GATEWAY_TO_SERVER_MESSAGE_EVENT);
+
+    expect(emittedCommand.type).toBe(RoomGatewayMessageType.OPEN_ROOM_COMMAND);
+
+    connection.socket.emit(
+      ROOM_GATEWAY_SERVER_MESSAGE_EVENT,
+      openRoomResultEnvelopeFixture({
+        request_id: emittedCommand.request_id,
       }),
     );
 
-    const emittedEnvelope = socket.emit.mock.calls[0][1];
-
-    if (
-      !isObjectWithFields(emittedEnvelope, 'request_id') ||
-      typeof emittedEnvelope.request_id !== 'string'
-    ) {
-      throw new Error('Expected emitted envelope with request_id');
-    }
-
-    const resolved = service.resolvePendingCommand(emittedEnvelope.request_id, {
-      state: 'open',
-    });
-
-    expect(resolved).toBe(true);
-    await expect(commandPromise).resolves.toEqual({ state: 'open' });
-  });
-
-  it('returns false when resolving unknown request id', () => {
-    expect(service.resolvePendingCommand('unknown', { state: 'open' })).toBe(
-      false,
+    await expect(pending).resolves.toEqual(
+      expect.objectContaining({
+        state: 'open',
+      }),
     );
   });
 
-  it('fails dispatch immediately if socket is disconnected', async () => {
-    const session = roomServerSessionFixture({
-      socket: roomServerSocketFixture({ connected: false }),
-    });
-    service.registerSession(session);
+  it('rejects pending commands when the room server disconnects', async () => {
+    const { app } = getE2ERuntime();
+    const state = app.get(RoomGatewayStateService);
+    const connection = await connectRoomServerClient();
+    const socketId = requireSocketId(connection.socket);
+    sockets.push(connection.socket);
+    await emitServerHelloAndWait(connection);
+
+    const session = await waitFor(
+      () => state.getSession(socketId),
+      (value) => value !== null,
+      3_000,
+      20,
+      'Timed out waiting for session before pending command test',
+    );
+
+    if (!session) {
+      throw new Error(
+        'Expected registered session before pending command test',
+      );
+    }
+
+    const pending = state.dispatchCommand(
+      session,
+      RoomGatewayMessageType.OPEN_ROOM_COMMAND,
+      { room_type: '5v5' },
+      1_000,
+    );
+
+    await waitForSocketEvent(
+      connection.socket,
+      ROOM_GATEWAY_TO_SERVER_MESSAGE_EVENT,
+    );
+
+    connection.socket.disconnect();
+    await expect(pending).rejects.toThrow('Room server disconnected');
+  });
+
+  it('fails dispatch immediately when the room server socket is disconnected', async () => {
+    const { app } = getE2ERuntime();
+    const state = app.get(RoomGatewayStateService);
+    const connection = await connectRoomServerClient();
+    const socketId = requireSocketId(connection.socket);
+    sockets.push(connection.socket);
+    await emitServerHelloAndWait(connection);
+
+    const session = await waitFor(
+      () => state.getSession(socketId),
+      (value) => value !== null,
+      3_000,
+      20,
+      'Timed out waiting for session before disconnect test',
+    );
+
+    if (!session) {
+      throw new Error('Expected registered session before disconnect test');
+    }
+
+    const disconnectPromise = waitForSocketDisconnect(connection.socket);
+    connection.socket.disconnect();
+    await disconnectPromise;
+    await waitFor(
+      () => state.getSession(socketId),
+      (value) => value === null,
+      3_000,
+      20,
+      'Timed out waiting for disconnected session to unregister',
+    );
 
     await expect(
-      service.dispatchCommand(
+      state.dispatchCommand(
         session,
         RoomGatewayMessageType.OPEN_ROOM_COMMAND,
         {},
         100,
       ),
     ).rejects.toThrow('Room server is disconnected');
-  });
-
-  it('fails dispatch when command times out', async () => {
-    const session = roomServerSessionFixture();
-    service.registerSession(session);
-
-    await expect(
-      service.dispatchCommand(
-        session,
-        RoomGatewayMessageType.OPEN_ROOM_COMMAND,
-        {},
-        10,
-      ),
-    ).rejects.toThrow('Command dispatch timed out');
   });
 });

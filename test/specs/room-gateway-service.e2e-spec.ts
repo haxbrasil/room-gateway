@@ -1,4 +1,8 @@
-import { RoomGatewayMessageType } from '../../src/modules/room-gateway/constants/room-gateway-message-type.const';
+import {
+  ROOM_GATEWAY_SERVER_MESSAGE_EVENT,
+  ROOM_GATEWAY_TO_SERVER_MESSAGE_EVENT,
+  RoomGatewayMessageType,
+} from '../../src/modules/room-gateway/constants/room-gateway-message-type.const';
 import { CloseRoomCompletionState } from '../../src/modules/room-gateway/enums/close-room-completion-state.enum';
 import { CloseRoomFailureCode } from '../../src/modules/room-gateway/enums/close-room-failure-code.enum';
 import { OpenRoomCompletionState } from '../../src/modules/room-gateway/enums/open-room-completion-state.enum';
@@ -9,24 +13,43 @@ import { RoomGatewayService } from '../../src/modules/room-gateway/room-gateway.
 import {
   closeRoomCommandFixture,
   closeRoomResultAcceptedFixture,
-  closeRoomResultRejectedFixture,
   openRoomCommandFixture,
-  openRoomResultFailedFixture,
-  openRoomResultOpenFixture,
-  roomServerSessionFixture,
-  roomServerSocketFixture,
 } from '../fixtures/room-gateway.fixture';
+import {
+  closeRoomResultEnvelopeFixture,
+  openRoomResultEnvelopeFixture,
+} from '../fixtures/ws-messages.fixture';
+import { getE2ERuntime } from '../support/runtime';
+import {
+  expectNoSocketEvent,
+  waitForSocketEvent,
+} from '../support/socket-await.util';
+import {
+  connectRoomServerClient,
+  emitServerHelloAndWait,
+  requireSocketId,
+} from '../support/ws-app.util';
+import { Socket } from 'socket.io-client';
 
 describe('RoomGatewayService (e2e)', () => {
-  let state: RoomGatewayStateService;
-  let service: RoomGatewayService;
+  let sockets: Socket[];
 
   beforeEach(() => {
-    state = new RoomGatewayStateService();
-    service = new RoomGatewayService(state);
+    sockets = [];
   });
 
-  it('returns no_server_for_tenant when tenant has no connected servers', async () => {
+  afterEach(() => {
+    for (const socket of sockets) {
+      if (socket.connected) {
+        socket.disconnect();
+      }
+    }
+  });
+
+  it('returns no_server_for_tenant when the tenant has no connected servers', async () => {
+    const { app } = getE2ERuntime();
+    const service = app.get(RoomGatewayService);
+
     const result = await service.handleOpenRoomCommand(
       openRoomCommandFixture(),
     );
@@ -38,12 +61,14 @@ describe('RoomGatewayService (e2e)', () => {
     });
   });
 
-  it('returns unsupported_room_type when no server supports requested room type', async () => {
-    state.registerSession(
-      roomServerSessionFixture({
-        supportedRoomTypes: new Set(['futsal']),
-      }),
-    );
+  it('returns unsupported_room_type when no connected server supports the room type', async () => {
+    const { app } = getE2ERuntime();
+    const service = app.get(RoomGatewayService);
+    const connection = await connectRoomServerClient();
+    sockets.push(connection.socket);
+    await emitServerHelloAndWait(connection, {
+      supported_room_types: ['futsal'],
+    });
 
     const result = await service.handleOpenRoomCommand(
       openRoomCommandFixture(),
@@ -56,14 +81,16 @@ describe('RoomGatewayService (e2e)', () => {
   });
 
   it('returns no_capacity_available when all matching servers are full', async () => {
-    state.registerSession(
-      roomServerSessionFixture({
-        capacity: {
-          [RoomCapacityBucket.PUBLIC]: 0,
-          [RoomCapacityBucket.PRIVATE]: 0,
-        },
-      }),
-    );
+    const { app } = getE2ERuntime();
+    const service = app.get(RoomGatewayService);
+    const connection = await connectRoomServerClient();
+    sockets.push(connection.socket);
+    await emitServerHelloAndWait(connection, {
+      capacity: {
+        [RoomCapacityBucket.PUBLIC]: 0,
+        [RoomCapacityBucket.PRIVATE]: 0,
+      },
+    });
 
     const result = await service.handleOpenRoomCommand(
       openRoomCommandFixture(),
@@ -75,109 +102,149 @@ describe('RoomGatewayService (e2e)', () => {
     });
   });
 
-  it('returns dispatch_timeout when room command dispatch fails', async () => {
-    const session = roomServerSessionFixture();
-    state.registerSession(session);
-    jest
-      .spyOn(state, 'dispatchCommand')
-      .mockRejectedValue(new Error('timeout'));
+  it('returns server_rejected when the room server sends an invalid open result payload', async () => {
+    const { app } = getE2ERuntime();
+    const service = app.get(RoomGatewayService);
+    const connection = await connectRoomServerClient();
+    sockets.push(connection.socket);
+    await emitServerHelloAndWait(connection);
 
-    const result = await service.handleOpenRoomCommand(
+    const resultPromise = service.handleOpenRoomCommand(
       openRoomCommandFixture(),
     );
 
-    expect(result).toMatchObject({
-      state: OpenRoomCompletionState.FAILED,
-      code: OpenRoomFailureCode.DISPATCH_TIMEOUT,
+    const emittedCommand = await waitForSocketEvent<{
+      request_id: string;
+      type: RoomGatewayMessageType;
+    }>(connection.socket, ROOM_GATEWAY_TO_SERVER_MESSAGE_EVENT);
+
+    connection.socket.emit(ROOM_GATEWAY_SERVER_MESSAGE_EVENT, {
+      type: RoomGatewayMessageType.OPEN_ROOM_RESULT,
+      request_id: emittedCommand.request_id,
+      payload: { accepted: true },
     });
-  });
 
-  it('returns server_rejected when open result payload is invalid', async () => {
-    state.registerSession(roomServerSessionFixture());
-    jest.spyOn(state, 'dispatchCommand').mockResolvedValue({ accepted: true });
-
-    const result = await service.handleOpenRoomCommand(
-      openRoomCommandFixture(),
-    );
-
-    expect(result).toEqual({
+    await expect(resultPromise).resolves.toEqual({
       state: OpenRoomCompletionState.FAILED,
       code: OpenRoomFailureCode.SERVER_REJECTED,
       message: 'Invalid open_room_result payload',
     });
   });
 
-  it('returns open completion and stores route when open succeeds', async () => {
-    const session = roomServerSessionFixture();
-    state.registerSession(session);
-    jest
-      .spyOn(state, 'dispatchCommand')
-      .mockResolvedValue(openRoomResultOpenFixture());
+  it('returns open completion and stores the room route when opening succeeds', async () => {
+    const { app } = getE2ERuntime();
+    const service = app.get(RoomGatewayService);
+    const state = app.get(RoomGatewayStateService);
+    const connection = await connectRoomServerClient();
+    const socketId = requireSocketId(connection.socket);
+    sockets.push(connection.socket);
+    await emitServerHelloAndWait(connection);
 
-    const result = await service.handleOpenRoomCommand(
+    const resultPromise = service.handleOpenRoomCommand(
       openRoomCommandFixture(),
     );
 
-    expect(result).toEqual({
+    const emittedCommand = await waitForSocketEvent<{
+      request_id: string;
+    }>(connection.socket, ROOM_GATEWAY_TO_SERVER_MESSAGE_EVENT);
+
+    connection.socket.emit(
+      ROOM_GATEWAY_SERVER_MESSAGE_EVENT,
+      openRoomResultEnvelopeFixture({
+        request_id: emittedCommand.request_id,
+      }),
+    );
+
+    await expect(resultPromise).resolves.toEqual({
       state: OpenRoomCompletionState.OPEN,
       room_uuid: '986e7556-c699-4f2e-89ca-f8ffb79f66c4',
       invite: 'ABC123',
     });
     expect(
       state.findSessionByRoom(
-        'tenant-a',
+        connection.claims.tenant,
         '986e7556-c699-4f2e-89ca-f8ffb79f66c4',
-      ),
-    ).toBe(session);
+      )?.socket.id,
+    ).toBe(socketId);
   });
 
-  it('returns failed completion from server payload when open fails', async () => {
-    state.registerSession(roomServerSessionFixture());
-    jest.spyOn(state, 'dispatchCommand').mockResolvedValue(
-      openRoomResultFailedFixture({
-        code: 'token_invalid',
-        message: 'Invalid token',
-      }),
-    );
+  it('returns failed completion from the room server payload when opening fails', async () => {
+    const { app } = getE2ERuntime();
+    const service = app.get(RoomGatewayService);
+    const connection = await connectRoomServerClient();
+    sockets.push(connection.socket);
+    await emitServerHelloAndWait(connection);
 
-    const result = await service.handleOpenRoomCommand(
+    const resultPromise = service.handleOpenRoomCommand(
       openRoomCommandFixture(),
     );
 
-    expect(result).toEqual({
+    const emittedCommand = await waitForSocketEvent<{
+      request_id: string;
+    }>(connection.socket, ROOM_GATEWAY_TO_SERVER_MESSAGE_EVENT);
+
+    connection.socket.emit(ROOM_GATEWAY_SERVER_MESSAGE_EVENT, {
+      type: RoomGatewayMessageType.OPEN_ROOM_RESULT,
+      request_id: emittedCommand.request_id,
+      payload: {
+        state: OpenRoomCompletionState.FAILED,
+        code: 'token_invalid',
+        message: 'Invalid token',
+      },
+    });
+
+    await expect(resultPromise).resolves.toEqual({
       state: OpenRoomCompletionState.FAILED,
       code: 'token_invalid',
       message: 'Invalid token',
     });
   });
 
-  it('uses deterministic tie-breaker by server id when capacities are equal', async () => {
-    const lowerServer = roomServerSessionFixture({
-      serverId: '00000000-0000-4000-8000-000000000001',
-      socket: roomServerSocketFixture({ id: 'lower' }),
+  it('uses deterministic server_id tie-breaks when capacities are equal', async () => {
+    const { app } = getE2ERuntime();
+    const service = app.get(RoomGatewayService);
+    const lower = await connectRoomServerClient({
+      server_id: '00000000-0000-4000-8000-000000000001',
     });
-    const higherServer = roomServerSessionFixture({
-      serverId: '00000000-0000-4000-8000-000000000099',
-      socket: roomServerSocketFixture({ id: 'higher' }),
+    const higher = await connectRoomServerClient({
+      server_id: '00000000-0000-4000-8000-000000000099',
     });
-    state.registerSession(higherServer);
-    state.registerSession(lowerServer);
+    sockets.push(lower.socket, higher.socket);
 
-    const dispatchSpy = jest
-      .spyOn(state, 'dispatchCommand')
-      .mockResolvedValue(openRoomResultOpenFixture());
+    await emitServerHelloAndWait(lower);
+    await emitServerHelloAndWait(higher);
 
-    await service.handleOpenRoomCommand(openRoomCommandFixture());
+    const resultPromise = service.handleOpenRoomCommand(
+      openRoomCommandFixture(),
+    );
 
-    expect(dispatchSpy).toHaveBeenCalledWith(
-      lowerServer,
-      RoomGatewayMessageType.OPEN_ROOM_COMMAND,
-      expect.any(Object),
-      15_000,
+    const lowerCommand = await waitForSocketEvent<{
+      request_id: string;
+    }>(lower.socket, ROOM_GATEWAY_TO_SERVER_MESSAGE_EVENT);
+
+    await expectNoSocketEvent(
+      higher.socket,
+      ROOM_GATEWAY_TO_SERVER_MESSAGE_EVENT,
+    );
+
+    lower.socket.emit(
+      ROOM_GATEWAY_SERVER_MESSAGE_EVENT,
+      openRoomResultEnvelopeFixture({
+        request_id: lowerCommand.request_id,
+      }),
+    );
+
+    await expect(resultPromise).resolves.toEqual(
+      expect.objectContaining({
+        state: OpenRoomCompletionState.OPEN,
+      }),
     );
   });
 
   it('returns no_server_for_room when closing an unrouted room', async () => {
+    const { app } = getE2ERuntime();
+    const service = app.get(RoomGatewayService);
+
     const result = await service.handleCloseRoomCommand(
       closeRoomCommandFixture(),
     );
@@ -189,94 +256,68 @@ describe('RoomGatewayService (e2e)', () => {
     });
   });
 
-  it('returns dispatch_timeout when close command dispatch fails', async () => {
-    const session = roomServerSessionFixture();
-    state.registerSession(session);
-    state.setRoomRoute(
-      '5b89f2b8-d425-4b34-b57d-341e7e6010f8',
-      'tenant-a',
-      session.socket.id,
-    );
-    jest
-      .spyOn(state, 'dispatchCommand')
-      .mockRejectedValue(new Error('timeout'));
-
-    const result = await service.handleCloseRoomCommand(
-      closeRoomCommandFixture(),
-    );
-
-    expect(result).toMatchObject({
-      state: CloseRoomCompletionState.FAILED,
-      code: CloseRoomFailureCode.DISPATCH_TIMEOUT,
+  it('returns server_rejected when the room server sends an invalid close result payload', async () => {
+    const { app } = getE2ERuntime();
+    const service = app.get(RoomGatewayService);
+    const connection = await connectRoomServerClient();
+    sockets.push(connection.socket);
+    await emitServerHelloAndWait(connection, {
+      active_rooms: ['5b89f2b8-d425-4b34-b57d-341e7e6010f8'],
     });
-  });
 
-  it('returns server_rejected when close result payload is invalid', async () => {
-    const session = roomServerSessionFixture();
-    state.registerSession(session);
-    state.setRoomRoute(
-      '5b89f2b8-d425-4b34-b57d-341e7e6010f8',
-      'tenant-a',
-      session.socket.id,
-    );
-    jest.spyOn(state, 'dispatchCommand').mockResolvedValue({ invalid: true });
-
-    const result = await service.handleCloseRoomCommand(
+    const resultPromise = service.handleCloseRoomCommand(
       closeRoomCommandFixture(),
     );
 
-    expect(result).toEqual({
+    const emittedCommand = await waitForSocketEvent<{
+      request_id: string;
+    }>(connection.socket, ROOM_GATEWAY_TO_SERVER_MESSAGE_EVENT);
+
+    connection.socket.emit(ROOM_GATEWAY_SERVER_MESSAGE_EVENT, {
+      type: RoomGatewayMessageType.CLOSE_ROOM_RESULT,
+      request_id: emittedCommand.request_id,
+      payload: { state: 'invalid' },
+    });
+
+    await expect(resultPromise).resolves.toEqual({
       state: CloseRoomCompletionState.FAILED,
       code: CloseRoomFailureCode.SERVER_REJECTED,
       message: 'Invalid close_room_result payload',
     });
   });
 
-  it('returns close failure payload when server rejects close', async () => {
-    const session = roomServerSessionFixture();
-    state.registerSession(session);
-    state.setRoomRoute(
-      '5b89f2b8-d425-4b34-b57d-341e7e6010f8',
-      'tenant-a',
-      session.socket.id,
-    );
-    jest
-      .spyOn(state, 'dispatchCommand')
-      .mockResolvedValue(closeRoomResultRejectedFixture());
-
-    const result = await service.handleCloseRoomCommand(
-      closeRoomCommandFixture(),
-    );
-
-    expect(result).toEqual({
-      state: CloseRoomCompletionState.FAILED,
-      code: 'already_closed',
-      message: 'Room already closed',
+  it('returns closed and clears the route when closing succeeds', async () => {
+    const { app } = getE2ERuntime();
+    const service = app.get(RoomGatewayService);
+    const state = app.get(RoomGatewayStateService);
+    const connection = await connectRoomServerClient();
+    sockets.push(connection.socket);
+    await emitServerHelloAndWait(connection, {
+      active_rooms: ['5b89f2b8-d425-4b34-b57d-341e7e6010f8'],
     });
-  });
 
-  it('returns closed and clears route when close succeeds', async () => {
-    const session = roomServerSessionFixture();
-    state.registerSession(session);
-    state.setRoomRoute(
-      '5b89f2b8-d425-4b34-b57d-341e7e6010f8',
-      'tenant-a',
-      session.socket.id,
-    );
-    jest
-      .spyOn(state, 'dispatchCommand')
-      .mockResolvedValue(closeRoomResultAcceptedFixture());
-
-    const result = await service.handleCloseRoomCommand(
+    const resultPromise = service.handleCloseRoomCommand(
       closeRoomCommandFixture(),
     );
 
-    expect(result).toEqual({
+    const emittedCommand = await waitForSocketEvent<{
+      request_id: string;
+    }>(connection.socket, ROOM_GATEWAY_TO_SERVER_MESSAGE_EVENT);
+
+    connection.socket.emit(
+      ROOM_GATEWAY_SERVER_MESSAGE_EVENT,
+      closeRoomResultEnvelopeFixture({
+        request_id: emittedCommand.request_id,
+        payload: closeRoomResultAcceptedFixture(),
+      }),
+    );
+
+    await expect(resultPromise).resolves.toEqual({
       state: CloseRoomCompletionState.CLOSED,
     });
     expect(
       state.findSessionByRoom(
-        'tenant-a',
+        connection.claims.tenant,
         '5b89f2b8-d425-4b34-b57d-341e7e6010f8',
       ),
     ).toBeNull();

@@ -1,11 +1,15 @@
 import { JwtService } from '@nestjs/jwt';
 
-export const GATEWAY_JWT_SECRET = 'gateway-jwt-secret';
+export const GATEWAY_JWT_SECRET =
+  process.env.GATEWAY_JWT_PUBLIC_KEY ?? 'gateway-jwt-secret';
 type GatewayJwtAlgorithm = 'HS256';
 
-export const GATEWAY_JWT_ALGO: GatewayJwtAlgorithm = 'HS256';
-export const GATEWAY_JWT_ISSUER = 'haxbrasil-gateway';
-export const GATEWAY_JWT_AUDIENCE = 'haxbrasil-room-server';
+export const GATEWAY_JWT_ALGO: GatewayJwtAlgorithm =
+  (process.env.GATEWAY_JWT_ALGO as GatewayJwtAlgorithm | undefined) ?? 'HS256';
+export const GATEWAY_JWT_ISSUER =
+  process.env.GATEWAY_JWT_ISS ?? 'haxbrasil-gateway';
+export const GATEWAY_JWT_AUDIENCE =
+  process.env.GATEWAY_JWT_AUD ?? 'haxbrasil-room-server';
 
 type GatewayJwtPayload = Record<string, unknown>;
 type GatewayJwtSignOptions = {

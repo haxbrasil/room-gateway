@@ -14,8 +14,6 @@ import {
   ROOM_GATEWAY_SERVER_MESSAGE_EVENT,
 } from './constants/room-gateway-message-type.const';
 import { CapacityUpdateDto } from './dtos/capacity-update.dto';
-import { CloseRoomResultDto } from './dtos/close-room-result.dto';
-import { OpenRoomResultDto } from './dtos/open-room-result.dto';
 import { RoomClosedDto } from './dtos/room-closed.dto';
 import { RoomGatewayEnvelopeDto } from './dtos/room-gateway-envelope.dto';
 import { RoomHeartbeatDto } from './dtos/room-heartbeat.dto';
@@ -185,24 +183,26 @@ export class RoomGatewayWsGateway {
       }
 
       case RoomGatewayMessageType.OPEN_ROOM_RESULT: {
-        const payload = parseDto(envelope.payload, OpenRoomResultDto);
-
-        if (!payload || !envelope.request_id) {
+        if (!envelope.request_id) {
           return;
         }
 
-        this.stateService.resolvePendingCommand(envelope.request_id, payload);
+        this.stateService.resolvePendingCommand(
+          envelope.request_id,
+          envelope.payload,
+        );
         return;
       }
 
       case RoomGatewayMessageType.CLOSE_ROOM_RESULT: {
-        const payload = parseDto(envelope.payload, CloseRoomResultDto);
-
-        if (!payload || !envelope.request_id) {
+        if (!envelope.request_id) {
           return;
         }
 
-        this.stateService.resolvePendingCommand(envelope.request_id, payload);
+        this.stateService.resolvePendingCommand(
+          envelope.request_id,
+          envelope.payload,
+        );
         return;
       }
 

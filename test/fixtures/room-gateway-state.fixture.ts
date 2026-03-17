@@ -15,19 +15,37 @@ export function roomGatewayStateServiceMockFixture(
   sessions: RoomServerSession[] = [],
 ): jest.Mocked<RoomGatewayStateServiceMock> {
   return {
-    listTenantSessions: jest.fn((_tenant: string) => sessions),
+    listTenantSessions: jest.fn((tenant: string) => {
+      void tenant;
+      return sessions;
+    }),
     dispatchCommand: jest.fn(
-      async (
-        _session: RoomServerSession,
-        _type: RoomGatewayMessageType,
+      (
+        session: RoomServerSession,
+        type: RoomGatewayMessageType,
         payload: unknown,
-        _timeoutMs: number,
-      ) => payload,
+        timeoutMs: number,
+      ) => {
+        void session;
+        void type;
+        void timeoutMs;
+        return Promise.resolve(payload);
+      },
     ),
     setRoomRoute: jest.fn(
-      (_roomUuid: string, _tenant: string, _socketId: string) => undefined,
+      (roomUuid: string, tenant: string, socketId: string) => {
+        void roomUuid;
+        void tenant;
+        void socketId;
+      },
     ),
-    findSessionByRoom: jest.fn((_tenant: string, _roomUuid: string) => null),
-    removeRoomRoute: jest.fn((_roomUuid: string) => undefined),
+    findSessionByRoom: jest.fn((tenant: string, roomUuid: string) => {
+      void tenant;
+      void roomUuid;
+      return null;
+    }),
+    removeRoomRoute: jest.fn((roomUuid: string) => {
+      void roomUuid;
+    }),
   };
 }

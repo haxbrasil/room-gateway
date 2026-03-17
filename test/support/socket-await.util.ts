@@ -41,6 +41,27 @@ export async function waitForSocketDisconnect(
   });
 }
 
+export async function expectNoSocketEvent(
+  socket: Socket,
+  eventName: string,
+  timeoutMs = 250,
+): Promise<void> {
+  await new Promise<void>((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      socket.off(eventName, onEvent);
+      resolve();
+    }, timeoutMs);
+
+    const onEvent = () => {
+      clearTimeout(timeout);
+      socket.off(eventName, onEvent);
+      reject(new Error(`Unexpected socket event: ${eventName}`));
+    };
+
+    socket.on(eventName, onEvent);
+  });
+}
+
 export function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
